@@ -1,0 +1,320 @@
+{
+	"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+	"contentVersion": "1.0.0.0",
+    "parameters": {
+        "vmSize": {
+            "type": "string",
+            "metadata": {
+                "description": "B1S is 1 CPU, 1 MB memory and costs about $7.39 per month, we don't need more..."
+            },
+            "defaultValue": "Standard_B1s"
+        },
+        "adminUsername": {
+            "type": "string",
+            "metadata": {
+                "description": "Username for both VMs"
+            },
+            "defaultValue": "azureuser"
+        },
+        "adminPassword": {
+            "type": "securestring",
+            "metadata": {
+                "description": "Password for both VMs"
+            }
+        },
+		"yourIPAddress": {
+			"type": "string",
+            "metadata": {
+                "description": "Format: 1.2.3.4 - You can use f.e. https://whatismyipaddress.com to find out your IPv4 IP Address"
+            }
+		},
+		"utcValue": {
+			"type": "string",
+            "metadata": {
+                "description": "Needed to enforce the redeployment of the VPN Peering every time this script is updated"
+            },
+			"defaultValue": "[utcNow()]"
+		}
+    },
+	"variables": { 
+		"numberOfNetworks": 2,
+		"contributorRole": "b24988ac-6180-42a0-ab88-20f7382dd24c"    // https://docs.microsoft.com/en-us/azure/role-based-access-control/built-in-roles#reader
+	},
+	"resources": [
+
+		// Managed Identity, needed for deployment script for VNet peering
+		{
+			"name": "deploymentIdentity",
+			"type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+			"apiVersion": "2018-11-30",
+			"location": "[resourceGroup().location]"
+		},
+		{   // Assign the contributor role to the resource group, see also: https://docs.microsoft.com/en-us/azure/role-based-access-control/role-assignments-template
+			"type": "Microsoft.Authorization/roleAssignments",       
+			"apiVersion": "2018-09-01-preview",
+			"name": "[guid(resourceGroup().id)]",
+			"dependsOn": [
+				"deploymentIdentity",
+				"vm1"                     // Though there is no dependency on vm1, this will prevent the role assignment to fail because the managed identity cannot be found just after creation
+			],
+			"properties": {
+				"roleDefinitionId": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Authorization/roleDefinitions/', variables('contributorRole'))]",
+				 "principalId": "[reference('Microsoft.ManagedIdentity/userAssignedIdentities/deploymentIdentity').principalId]"
+			}	
+		},
+
+		// Networks
+		{
+			"name": "[concat('VNet10_',copyIndex(1))]",
+			"type": "Microsoft.Network/virtualNetworks",
+			"apiVersion": "2019-11-01",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"addressSpace": {
+					"addressPrefixes": [
+						"[concat('10.',copyIndex(1),'.0.0/16')]"
+					]
+				},
+				"subnets": [
+					{
+						"name": "[concat('Subnet-10_',copyIndex(1),'_1')]",
+						"properties": {
+							"addressPrefix": "[concat('10.',copyIndex(1),'.1.0/24')]"
+						}
+					}
+				]
+			},
+			"copy": {
+				"name": "One for each network",
+				"count": "[variables('numberOfNetworks')]"
+			}
+		},
+		{
+			"type": "Microsoft.Resources/deploymentScripts",
+			"apiVersion": "2020-10-01",
+			"name": "ConnectViaVNetPeering",
+			"location": "[resourceGroup().location]",
+			"dependsOn": [
+				"[guid(resourceGroup().id)]",   // assignment of managed identity as contributor to the resource group 
+				"VNet10_1",
+				"VNet10_2"
+			],
+			"identity": {
+				"type": "UserAssigned",
+				"userAssignedIdentities": {
+						"[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'deploymentIdentity')]": {}
+				}
+			},
+			"kind": "AzurePowerShell",
+			"properties": {
+				"forceUpdateTag": "[parameters('utcValue')]",
+				"azPowerShellVersion": "3.0",
+				"timeout": "PT15M",
+				"arguments": "", 
+				"scriptContent": "
+					param()
+
+                    $vnet10_1=Get-AzVirtualNetwork -Name VNet10_1
+					$vnet10_2=Get-AzVirtualNetwork -Name VNet10_2
+					Add-AzVirtualNetworkPeering -Name 'VNet10_1-to-VNet10_2' -VirtualNetwork $vnet10_1 -RemoteVirtualNetworkId $vnet10_2.Id -BlockVirtualNetworkAccess
+					Add-AzVirtualNetworkPeering -Name 'VNet10_2-to-VNet10_1' -VirtualNetwork $vnet10_2 -RemoteVirtualNetworkId $vnet10_1.Id -BlockVirtualNetworkAccess
+				",
+				"cleanupPreference": "Always",
+				"retentionInterval": "PT1H"        // 1 hour is currently the minimum for this parameter
+			}
+		},
+
+		// Network Interface Cards (NICs) and NSGs
+		{
+			"name": "[concat('vm',copyIndex(1),'-PublicIP')]",
+			"type": "Microsoft.Network/publicIPAddresses",
+			"apiVersion": "2020-07-01",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"publicIPAllocationMethod": "Dynamic"
+			},
+			"copy": {
+				"name": "One for each network",
+				"count": "[variables('numberOfNetworks')]"
+			}
+		},
+		{
+			"name": "[concat('vm',copyIndex(1),'-nsg')]",
+			"type": "Microsoft.Network/networkSecurityGroups",
+			"apiVersion": "2020-07-01",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"securityRules": [
+					{
+						"name": "SSH",
+						"properties": {
+							"description": "SSH allowed from your own IP address (not between networks)",
+							"protocol": "Tcp",
+							"sourcePortRange": "*",
+							"destinationPortRange": "22",
+							"sourceAddressPrefix": "[concat(parameters('yourIPAddress'),'/32')]",
+							"destinationAddressPrefix": "*",
+							"access": "Allow",
+							"priority": 1000,
+							"direction": "Inbound"
+						}
+					},
+					{
+						"name": "Ping-from-the-other-network-to-this-network",
+						"properties": {
+							"description": "Ping from the other network to this network",
+							"protocol": "Icmp",
+							"sourcePortRange": "*",
+							"destinationPortRange": "*",
+							"sourceAddressPrefix": "[concat('10.',sub(variables('numberOfNetworks'), copyIndex()),'.0.0/16')]",
+							"destinationAddressPrefix": "[concat('10.',copyIndex(1),'.0.0/16')]",
+							"access": "Allow",
+							"priority": 1010,
+							"direction": "Inbound"
+						}
+					},
+					{
+						"name": "Block-all-other-inbound-traffic",
+						"properties": {
+							"description": "Block all other inbound traffic",
+							"protocol": "*",
+							"sourcePortRange": "*",
+							"destinationPortRange": "*",
+							"sourceAddressPrefix": "*",
+							"destinationAddressPrefix": "*",
+							"access": "Deny",
+							"priority": 1020,
+							"direction": "Inbound"
+						}						
+					},
+					{
+						"name": "Ping-from-this-network-to-the-other-network",
+						"properties": {
+							"description": "Ping from this network to the other network",
+							"protocol": "Icmp",
+							"sourcePortRange": "*",
+							"destinationPortRange": "*",
+							"sourceAddressPrefix": "[concat('10.',copyIndex(1),'.0.0/16')]",
+							"destinationAddressPrefix": "[concat('10.',sub(variables('numberOfNetworks'), copyIndex()),'.0.0/16')]",
+							"access": "Allow",
+							"priority": 1000,
+							"direction": "Outbound"
+						}
+					},
+					{
+						"name": "Block-all-other-outbound-traffic",
+						"properties": {
+							"description": "Block all other outbound traffic",
+							"protocol": "*",
+							"sourcePortRange": "*",
+							"destinationPortRange": "*",
+							"sourceAddressPrefix": "*",
+							"destinationAddressPrefix": "*",
+							"access": "Deny",
+							"priority": 1010,
+							"direction": "Outbound"
+						}						
+					}
+				]
+			},
+			"copy": {
+				"name": "One for each network",
+				"count": "[variables('numberOfNetworks')]"
+			}
+		},
+		{
+			"name": "[concat('vm',copyIndex(1),'-nic')]",
+			"type": "Microsoft.Network/networkInterfaces",
+			"apiVersion": "2020-07-01",
+			"location": "[resourceGroup().location]",
+				"dependsOn": [
+					"[concat('vm',copyIndex(1),'-PublicIP')]",
+					"[concat('VNet10_',copyIndex(1))]",
+					"[concat('vm',copyIndex(1),'-nsg')]"
+				],
+			"properties": {
+				"ipConfigurations": [
+					{
+						"name": "ipconfig",
+						"properties": {
+							"privateIPAllocationMethod": "Dynamic",
+							"publicIPAddress": {
+								"id": "[resourceId('Microsoft.Network/publicIpAddresses', concat('vm',copyIndex(1),'-PublicIP'))]"
+							},
+							"subnet": {
+								"id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat('VNet10_',copyIndex(1)), concat('Subnet-10_',copyIndex(1),'_1'))]"
+							}
+						}
+					}
+				],
+				"networkSecurityGroup": {
+					"id": "[resourceId('Microsoft.Network/networkSecurityGroups',concat('vm',copyIndex(1),'-nsg'))]"
+				}
+			},
+			"copy": {
+				"name": "One for each network",
+				"count": "[variables('numberOfNetworks')]"
+			}
+		},
+
+		// VMs
+		{
+			"name": "[concat('vm',copyIndex(1))]",
+			"type": "Microsoft.Compute/virtualMachines",
+			"apiVersion": "2019-07-01",
+			"location": "[resourceGroup().location]",
+			"dependsOn": [
+				"[concat('vm',copyIndex(1),'-nic')]"
+			],
+			"properties": {
+				"hardwareProfile": {
+					"vmSize": "[parameters('vmSize')]"
+				},
+				"osProfile": {
+					"computerName": "vm1",
+					"adminUsername": "[parameters('adminUsername')]",
+					"adminPassword": "[parameters('adminPassword')]"
+				},
+				"storageProfile": {
+					"imageReference": {
+						"publisher": "OpenLogic",
+						"offer": "CentOS",
+						"sku": "7.5",
+						"version": "latest"
+					},
+					"osDisk": {
+						"name": "[concat('vm',copyIndex(1),'-osDisk')]",
+						"caching": "ReadWrite",
+						"createOption": "FromImage"
+					}
+				},
+				"networkProfile": {
+					"networkInterfaces": [
+						{
+							"id": "[resourceId('Microsoft.Network/networkInterfaces', concat('vm',copyIndex(1),'-nic'))]"
+						}
+					]
+				}
+			},
+			"copy": {
+				"name": "One for each network",
+				"count": "[variables('numberOfNetworks')]"
+			}
+		},
+
+		// Policy 
+		{
+			"name": "PolicyAssignment",
+			"type": "Microsoft.Authorization/policyAssignments",
+			"apiVersion": "2020-03-01",
+			"properties": {
+				"displayName": "Policy assignment to resource group",
+				"policyDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/policyDefinitions','DisallowUnlimitedVNetPeeringTraffic')]",
+				"parameters": {},
+				"enforcementMode": "Default"
+			},
+			"location": "[resourceGroup().location]"
+		}
+	],
+	"outputs": {}
+}

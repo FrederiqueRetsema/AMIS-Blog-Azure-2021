@@ -1,0 +1,52 @@
+{
+	"$schema": "https://schema.management.azure.com/schemas/2019-04-01/subscriptionDeploymentTemplate.json#",
+	"contentVersion": "1.0.0.0",
+    "parameters": {
+		"location": {
+			"type": "string",
+			"metadata": {
+				"description": "Location. Defaults to WestEurope"
+			},
+			"defaultValue": "WestEurope"
+		}
+	},
+	"variables": {},
+	"resources": [
+
+		{
+			"name": "DisallowUnlimitedVNetPeeringTraffic",
+			"type": "Microsoft.Authorization/policyDefinitions",
+			"apiVersion": "2020-03-01",
+			"location": "[parameters('location')]",
+		    "properties": {
+				"displayName": "AMIS: Least Privileged: Traffic to remote virtual network should be disabled in VNet Peering",
+				"policyType": "Custom",
+				"mode": "all",
+				"description": "When traffic to remote virtual network is enabled, then all traffic (all protocols, all ports, etc) are enabled. This makes it possible for a hacker to hack into one system and then allows the hacker to access all the VNets that are attached to this network. It is better to switch this off and then configure in NSG's which traffic is allowed to go over network boundaries",
+				"metadata": {
+					"version": "0.0.1",
+					"category": "Access Control"
+				},
+				"parameters": {},
+				"policyRule": {
+					"if": {                
+						"allOf": [
+							{
+								"field": "type",
+								"equals": "Microsoft.Network/virtualNetworks"
+							},
+							{
+								"field": "Microsoft.Network/virtualNetworks/virtualNetworkPeerings[*].allowVirtualNetworkAccess",
+								"equals": "true"
+							}
+						]
+					},
+					"then": {
+						"effect": "deny"
+					}
+				}			
+			}
+		}
+	],
+	"outputs": {}
+}
