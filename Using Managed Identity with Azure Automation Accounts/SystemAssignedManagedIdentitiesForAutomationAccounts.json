@@ -1,0 +1,290 @@
+{
+	// SystemAssignedManagedIdentitiesForAutomationAccounts.json
+	// =========================================================
+	// Creates an automation account with a run book that will stop vm1. 
+	// It uses a System Assigned Managed Identity, which has Virtual Machine Contributor permissions on vm1
+	// It has no permissions on vm2. 
+	//
+	// This ARM template supports the blog "Using Manaqged Identity with Azure Automation" on the 
+	// AMIS Technology Blog (https://technology.amis.nl)
+	//
+	// Written by Frederique Retsema, donated to the Public Domain
+
+	"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+	"contentVersion": "1.0.0.0",
+    "parameters": {
+        "vmSize": {
+            "type": "string",
+            "metadata": {
+                "description": "B1S is 1 CPU, 1 MB memory and costs about $7.39 per month..."
+            },
+            "defaultValue": "Standard_B1s"
+        },
+        "adminUsername": {
+            "type": "string",
+            "metadata": {
+                "description": "Username for the VM"
+            },
+            "defaultValue": "azureuser"
+        },
+        "adminPassword": {
+            "type": "securestring",
+            "metadata": {
+                "description": "Password for the VM"
+            }
+        },
+		"myIPAddress": {
+			"type": "string",
+            "metadata": {
+                "description": "Format: 1.2.3.4 - You can use f.e. https://whatismyipaddress.com to find out your IPv4 IP Address"
+            }
+		}
+    },
+	"variables": { 
+		"virtualMachineContributorRole": "9980e02c-c2be-4d73-94e8-173b1dc7cf3c", // https://docs.microsoft.com/en-us/azure/role-based-access-control/built-in-roles#virtual-machine-contributor
+
+		// Source: go to www.powershellgallery.com, then search for the package and look (via F12 in the browser) where the Manual Download > "Download the raw nupkg file" link points to.
+		// I removed the version number, it turns out that you then get the latest version.
+		"AzAccountsLink": "https://www.powershellgallery.com/api/v2/package/Az.Accounts",
+		"AzComputeLink": "https://www.powershellgallery.com/api/v2/package/Az.Compute"
+	},
+	"resources": [
+
+		// Network
+		{
+			"name": "VNet1",
+			"type": "Microsoft.Network/virtualNetworks",
+			"apiVersion": "2020-07-01",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"addressSpace": {
+					"addressPrefixes": [
+						"10.0.0.0/16"
+					]
+				},
+				"subnets": [
+					{
+						"name": "Subnet-10_0_0",
+						"properties": {
+							"addressPrefix": "10.0.0.0/24"
+						}
+					}
+				]
+			}
+		},
+
+		// Network Interface Card (NIC) and NSG
+		{
+			"name": "[concat('vm',copyIndex(1),'-PublicIP')]",
+			"type": "Microsoft.Network/publicIPAddresses",
+			"apiVersion": "2020-07-01",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"publicIPAllocationMethod": "Dynamic"
+			},
+			"copy": {
+				"name": "One for each VM",
+				"count": 2
+			}
+		},
+		{
+			"name": "vm-nsg",
+			"type": "Microsoft.Network/networkSecurityGroups",
+			"apiVersion": "2020-07-01",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"securityRules": [
+					{
+						"name": "SSH",
+						"properties": {
+							"description": "SSH allowed from your own IP address (not between networks)",
+							"protocol": "Tcp",
+							"sourcePortRange": "*",
+							"destinationPortRange": "22",
+							"sourceAddressPrefix": "[concat(parameters('myIPAddress'),'/32')]",
+							"destinationAddressPrefix": "*",
+							"access": "Allow",
+							"priority": 1000,
+							"direction": "Inbound"
+						}
+					},
+					{
+						"name": "Block-all-other-inbound-traffic",
+						"properties": {
+							"description": "Block all other inbound traffic",
+							"protocol": "*",
+							"sourcePortRange": "*",
+							"destinationPortRange": "*",
+							"sourceAddressPrefix": "*",
+							"destinationAddressPrefix": "*",
+							"access": "Deny",
+							"priority": 1010,
+							"direction": "Inbound"
+						}
+					}
+				]
+			}
+		},
+		{
+			"name": "[concat('vm',copyIndex(1),'-nic')]",
+			"type": "Microsoft.Network/networkInterfaces",
+			"apiVersion": "2020-07-01",
+			"location": "[resourceGroup().location]",
+				"dependsOn": [
+					"[concat('vm',copyIndex(1),'-PublicIP')]",
+					"VNet1",
+					"vm-nsg"
+				],
+			"properties": {
+				"ipConfigurations": [
+					{
+						"name": "ipconfig",
+						"properties": {
+							"privateIPAllocationMethod": "Dynamic",
+							"publicIPAddress": {
+								"id": "[resourceId('Microsoft.Network/publicIpAddresses', concat('vm',copyIndex(1),'-PublicIP'))]"
+							},
+							"subnet": {
+								"id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', 'VNet1', 'Subnet-10_0_0')]"
+							}
+						}
+					}
+				],
+				"networkSecurityGroup": {
+					"id": "[resourceId('Microsoft.Network/networkSecurityGroups','vm-nsg')]"
+				}
+			},
+			"copy": {
+				"name": "One for each VM",
+				"count": 2
+			}
+		},
+
+		// VM
+		{
+			"name": "[concat('vm',copyIndex(1))]",
+			"type": "Microsoft.Compute/virtualMachines",
+			"apiVersion": "2020-12-01",
+			"location": "[resourceGroup().location]",
+			"dependsOn": [
+				"[concat('vm',copyIndex(1),'-nic')]",
+				"SystemAssignedManagedIdentityAutomationAccount"
+			],
+			"properties": {
+				"hardwareProfile": {
+					"vmSize": "[parameters('vmSize')]"
+				},
+				"osProfile": {
+					"computerName": "[concat('vm',copyIndex(1))]",
+					"adminUsername": "[parameters('adminUsername')]",
+					"adminPassword": "[parameters('adminPassword')]"
+				},
+				"storageProfile": {
+					"imageReference": {
+						"publisher": "OpenLogic",
+						"offer": "CentOS",
+						"sku": "7.5",
+						"version": "latest"
+					},
+					"osDisk": {
+						"name": "[concat('vm',copyIndex(1),'osDisk')]",
+						"caching": "ReadWrite",
+						"createOption": "FromImage"
+					}
+				},
+				"networkProfile": {
+					"networkInterfaces": [
+						{
+							"id": "[resourceId('Microsoft.Network/networkInterfaces', concat('vm',copyIndex(1), '-nic'))]"
+						}
+					]
+				}
+			},
+			"copy": {
+				"name": "One for each VM",
+				"count": 2
+			}
+		},
+		{   // Assign the contributor role to the resource
+		    // Only for vm1, not to vm2: we want to prove that the managed identity is used and not a RunAs user that has permissions for the whole subscription
+			"type": "Microsoft.Authorization/roleAssignments",       
+			"apiVersion": "2021-04-01-preview",
+			"name": "[guid(resourceGroup().id, 'vm1')]", 
+			"scope": "Microsoft.Compute/virtualMachines/vm1",
+			"dependsOn": [
+				"vm1",
+				"SystemAssignedManagedIdentityAutomationAccount"
+			],
+			"properties": {
+				"roleDefinitionId": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Authorization/roleDefinitions/', variables('virtualMachineContributorRole'))]",
+				 "principalId": "[reference(resourceId('Microsoft.Automation/automationAccounts','SystemAssignedManagedIdentityAutomationAccount'),'2020-01-13-preview','Full').identity.principalId]"
+			}	
+		},
+
+		// Automation Account
+		{
+			"name": "SystemAssignedManagedIdentityAutomationAccount",
+			"type": "Microsoft.Automation/automationAccounts",
+			"apiVersion": "2020-01-13-preview",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"sku": {
+					"name": "Free"
+				}
+			},
+			"identity": {
+				"type": "SystemAssigned"
+			}
+		},
+		{
+			"name": "SystemAssignedManagedIdentityAutomationAccount/ResourceGroupName",
+			"type": "Microsoft.Automation/automationAccounts/variables",
+			"apiVersion": "2020-01-13-preview",
+			"dependsOn": [
+				"SystemAssignedManagedIdentityAutomationAccount"
+			],
+			"properties": {
+				// Value has to be within quotes, see: https://stackoverflow.com/questions/48170196/error-on-deployment-azure-automation-variable-assets
+				"value": "[concat('\"',resourceGroup().name,'\"')]",
+				"description": "Resourcegroup where the VMs are in"
+			}
+		},
+		// Modules
+		{
+			"name": "SystemAssignedManagedIdentityAutomationAccount/Az.Accounts",
+			"type": "Microsoft.Automation/automationAccounts/modules",
+			"apiVersion": "2020-01-13-preview",
+			"dependsOn": ["Microsoft.Automation/automationAccounts/SystemAssignedManagedIdentityAutomationAccount"],
+			"properties": {
+				"contentLink": {
+					"uri": "[variables('AzAccountsLink')]"
+				}
+			}
+		},
+		{
+			"name": "SystemAssignedManagedIdentityAutomationAccount/Az.Compute",
+			"type": "Microsoft.Automation/automationAccounts/modules",
+			"apiVersion": "2020-01-13-preview",
+			"dependsOn": ["[resourceId('Microsoft.Automation/automationAccounts/modules/','SystemAssignedManagedIdentityAutomationAccount', 'Az.Accounts')]"],
+			"properties": {
+				"contentLink": {
+					"uri": "[variables('AzComputeLink')]"
+				}
+			}
+		},
+		{
+			"name": "SystemAssignedManagedIdentityAutomationAccount/StopVM1",
+			"type": "Microsoft.Automation/automationAccounts/runbooks",
+			"apiVersion": "2019-06-01",
+			"dependsOn": ["[resourceId('Microsoft.Automation/automationAccounts/','SystemAssignedManagedIdentityAutomationAccount')]"],
+  	 	 	"location": "[resourceGroup().location]",
+			"properties": {
+				"runbookType": "PowerShell",
+    			"publishContentLink": {
+					"uri": "https://frpublic.s3-eu-west-1.amazonaws.com/AMIS/install+scripts/Stop-VM1.ps1"
+				}
+			}
+		}
+	],
+	"outputs": {}
+}
