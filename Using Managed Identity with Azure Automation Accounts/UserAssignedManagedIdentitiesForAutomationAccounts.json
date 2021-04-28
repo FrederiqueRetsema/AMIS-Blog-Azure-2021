@@ -5,7 +5,7 @@
 	// It uses a User Assigned Managed Identity, which has Virtual Machine Contributor permissions on vm1
 	// It has no permissions on vm2. 
 	//
-	// This ARM template supports the blog "Using Manaqged Identity with Azure Automation" on the 
+	// This ARM template supports the blog "Using a Managed Identity with Azure Automation Accounts" on the 
 	// AMIS Technology Blog (https://technology.amis.nl)
 	//
 	// Currently (28-04-2021) this script will deploy all resources without errors. When you start the 
