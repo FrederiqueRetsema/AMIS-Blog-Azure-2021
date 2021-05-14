@@ -1,0 +1,241 @@
+{
+	// AutomationAccount with runbook that checks for RunAs accounts in Automation Accounts.json
+	// =========================================================================================
+	// Creates an automation account with a run book that will check for Automation Accounts with RunAs accounts in the current subscription. 
+	// It uses a System Assigned Managed Identity, you have to give this account reader permissions on subscription level to make this work!
+	//
+	// This ARM template supports the blog "Check for RunAs accounts in Automation Accounts" on the 
+	// AMIS Technology Blog (https://technology.amis.nl)
+	//
+	// Written by Frederique Retsema, donated to the Public Domain
+
+	"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+	"contentVersion": "1.0.0.0",
+    "parameters": {
+        "emailAddress": {
+            "type": "string",
+            "metadata": {
+                "description": "When a RunAs account is found, an email will be send to this address"
+            }
+        },
+		"testEnvironment": {
+			"type": "bool",
+			"metadata": {
+				"description": "Use Test = true for faster alerts (PT1M) and scheduled tasks every 5 minutes. For Test = false this is 1 alert per hour and scheduled tasks every hour."
+			},
+			"defaultValue": true
+		},
+		"deploymentTime": {
+			"type": "string",
+			"metadata": {
+				"description": "Randomized string to get a different hash for uniqueString every time this ARM template is deployed. Also used for start time in schedule."
+			},
+			"defaultValue": "[utcNow('u')]"
+		}
+    },
+	"variables": { 
+		// Source: go to www.powershellgallery.com, then search for the package and look (via F12 in the browser) where the Manual Download > "Download the raw nupkg file" link points to.
+		// I removed the version number, it turns out that you then get the latest version.
+		"AzAccountsLink": "https://www.powershellgallery.com/api/v2/package/Az.Accounts",
+		"AzAutomationLink": "https://www.powershellgallery.com/api/v2/package/Az.Automation",
+		"AzResourcesLink": "https://www.powershellgallery.com/api/v2/package/Az.Resources",
+
+		"randomString"         : "[substring(uniqueString(parameters('deploymentTime')),0,5)]",
+		"AutomationAccountName": "[concat('CheckRunAsAccountsInAutomationAccounts-', variables('randomString'))]",
+		"RunBookName"          : "[concat('CheckRunAsAccountsInAllSubscriptions-', variables('randomString'))]",
+		"ScheduleName"         : "[concat('CheckRunAsAccountsSchedule-', variables('randomString'))]",
+		"ActionGroupName"      : "[concat('CheckRunAsAccountsAlertActionGroup-', variables('randomString'))]",
+
+        "ScheduleAutomationTestInterval" : 15,              // 15 minutes is the minimum interval for schedules in Azure
+        "ScheduleAutomationTestFrequency" : "Minute",
+        "ScheduleAutomationTestFrequencyDescription" : "minute(s)",
+
+        "ScheduleAutomationProdInterval" : 1,
+        "ScheduleAutomationProdFrequency" : "Hour",
+        "ScheduleAutomationProdFrequencyDescription" : "hour(s)",
+
+		"evaluationFrequencyTest": "PT1M",
+		"evaluationFrequencyProd": "PT1H",
+
+		"windowSizeTest": "PT1M",
+		"windowSizeProd": "PT1H",
+
+		"severity": 2 // 0 = Critical, 1 = Error, 2 = Warning, 3 = Informational, 4 = Verbose
+	},
+	"resources": [
+
+		// Automation Account
+		{
+			"name": "[variables('AutomationAccountName')]",
+			"type": "Microsoft.Automation/automationAccounts",
+			"apiVersion": "2020-01-13-preview",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"sku": {
+					"name": "Free"
+				}
+			},
+			"identity": {
+				"type": "SystemAssigned"
+			}
+		},
+		// Modules
+		{
+			"name": "[concat(variables('AutomationAccountName'),'/Az.Accounts')]",
+			"type": "Microsoft.Automation/automationAccounts/modules",
+			"apiVersion": "2020-01-13-preview",
+			"dependsOn": [
+				"[variables('AutomationAccountName')]"
+			],
+			"properties": {
+				"contentLink": {
+					"uri": "[variables('AzAccountsLink')]"
+				}
+			}
+		},
+		{
+			"name": "[concat(variables('AutomationAccountName'),'/Az.Automation')]",
+			"type": "Microsoft.Automation/automationAccounts/modules",
+			"apiVersion": "2020-01-13-preview",
+			"dependsOn": [
+				"[resourceId('Microsoft.Automation/automationAccounts/modules/',variables('AutomationAccountName'), 'Az.Accounts')]"
+			],
+			"properties": {
+				"contentLink": {
+					"uri": "[variables('AzAutomationLink')]"
+				}
+			}
+		},
+		{
+			"name": "[concat(variables('AutomationAccountName'),'/Az.Resources')]",
+			"type": "Microsoft.Automation/automationAccounts/modules",
+			"apiVersion": "2020-01-13-preview",
+			"dependsOn": ["[resourceId('Microsoft.Automation/automationAccounts/modules/',variables('AutomationAccountName'), 'Az.Accounts')]"],
+			"properties": {
+				"contentLink": {
+					"uri": "[variables('AzResourcesLink')]"
+				}
+			}
+		},
+		// Runbook
+		{
+			"name": "[concat(variables('AutomationAccountName'),'/', variables('RunBookName'))]",
+			"type": "Microsoft.Automation/automationAccounts/runbooks",
+			"apiVersion": "2019-06-01",
+			"dependsOn": ["[resourceId('Microsoft.Automation/automationAccounts/',variables('AutomationAccountName'))]"],
+  	 	 	"location": "[resourceGroup().location]",
+			"properties": {
+				"runbookType": "PowerShell",
+    			"publishContentLink": {
+					"uri": "https://frpublic.s3-eu-west-1.amazonaws.com/AMIS/install+scripts/CheckRunAsAccountsInAllSubscriptionsInRunbook.ps1"
+				}
+			}
+		},
+		// Schedule runbook
+		{
+			"name": "[concat(variables('AutomationAccountName'),'/', variables('ScheduleName'))]",
+			"type": "Microsoft.Automation/automationAccounts/schedules",
+			"apiVersion": "2020-01-13-preview",
+			"dependsOn": ["[resourceId('Microsoft.Automation/automationAccounts/',variables('AutomationAccountName'))]"],
+			"properties": {
+				"description": "[concat('Check for RunAs accounts every ', if(parameters('testEnvironment'), 
+				                                                              concat(variables('ScheduleAutomationTestInterval'), ' ', variables('ScheduleAutomationTestFrequencyDescription')), 
+																			  concat(variables('ScheduleAutomationProdInterval'), ' ', variables('ScheduleAutomationProdFrequencyDescription'))))]",
+				"startTime": "[dateTimeAdd(parameters('deploymentTime'), 'PT7M')]",     // When you don't add 7 minutes, the deployment will give a bad request error with message: 
+				                                                                     // "Argument requestScheduleData with value Orchestrator.Schedules.DataAccess.Models.ScheduleAllData is not valid. 
+																					 //          Error message: The start time of the schedule must be at least 5 minutes after the time you create the schedule. "
+				"frequency": "[if(parameters('testEnvironment'), variables('ScheduleAutomationTestFrequency'), variables('ScheduleAutomationProdFrequency'))]",
+				"interval": "[if(parameters('testEnvironment'), variables('ScheduleAutomationTestInterval'), variables('ScheduleAutomationProdInterval'))]"
+			}
+		},
+		{
+			"name": "[concat(variables('AutomationAccountName'), '/', guid(variables('ScheduleName')))]",
+			"type": "Microsoft.Automation/automationAccounts/jobSchedules",
+			"apiVersion": "2020-01-13-preview",
+			"dependsOn": [
+				 "[resourceId('Microsoft.Automation/automationAccounts/schedules', variables('AutomationAccountName'), variables('ScheduleName'))]",
+				 "[resourceId('Microsoft.Automation/automationAccounts/runbooks', variables('AutomationAccountName'), variables('RunBookName'))]"
+			],
+			"properties": {
+				"schedule": {
+					"name": "[variables('ScheduleName')]"
+				},
+				"runbook": {
+					"name": "[variables('RunBookName')]"
+				}
+			}
+		},
+
+		// Alert
+        {
+            "name": "CheckRunAsAccountsAlertFailed",
+            "type": "Microsoft.Insights/metricAlerts",
+            "location": "global",
+            "apiVersion": "2018-03-01",
+		    "dependsOn": [
+				"[resourceId('Microsoft.Automation/automationAccounts/runbooks',variables('AutomationAccountName'),variables('RunBookName'))]",
+				"[variables('ActionGroupName')]"
+			],
+            "properties": {
+                "description": "[concat('Check for RunAs accounts failed: see the errors in the RunBook ',variables('RunBookName'),' for details')]",
+                "severity": "[variables('severity')]", 
+                "enabled": true,
+                "scopes": ["[resourceId('Microsoft.Automation/automationAccounts', variables('AutomationAccountName'))]"],
+                "evaluationFrequency":"[if(parameters('testEnvironment'), variables('evaluationFrequencyTest'), variables('evaluationFrequencyProd'))]",
+                "windowSize": "[if(parameters('testEnvironment'), variables('windowSizeTest'), variables('windowSizeProd'))]",
+                "criteria": {
+                    "odata.type": "Microsoft.Azure.Monitor.MultipleResourceMultipleMetricCriteria",
+                    "allOf": [
+                        {
+                            "name" : "RunBook CheckForRunAsAccounts",
+							"criterionType": "StaticThresholdCriterion",
+							"metricNamespace": "Microsoft.Automation/automationAccounts",
+                            "metricName": "TotalJob", 
+                            "dimensions":[ {
+								"name": "Runbook",
+								"operator": "Include",
+								"values": ["[variables('RunBookName')]"]
+							},
+							{
+								"name": "Status",
+								"operator": "Include",
+								"values": ["Failed"]
+							}],
+                            "operator": "GreaterThanOrEqual",
+                            "threshold" : 1,
+                            "timeAggregation": "Total",
+							"alertSensitivity": "High",
+							"failingPeriods": {
+								"minFailingPeriodsToAlert": 1,
+								"numberOfEvaluationPeriods": 1
+							}
+                        }
+                    ]
+                },
+                "actions": [
+                    {
+                        "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups', variables('ActionGroupName'))]"
+                    }
+                ]
+            }
+        },
+        {
+            "name": "[variables('ActionGroupName')]",
+            "type": "Microsoft.Insights/actionGroups",
+            "location": "global",
+            "apiVersion": "2019-06-01",
+            "properties": {
+                "groupShortName": "RunAsAccount",
+                "enabled": true,
+				"emailReceivers": [ 
+					{
+						"name": "deployerEmail",
+						"emailAddress": "[parameters('emailAddress')]",
+						"useCommonAlertSchema": true
+ 				    }
+				]
+            }
+        }
+	],
+	"outputs": {}
+}
